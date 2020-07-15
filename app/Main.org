@@ -1,0 +1,182 @@
+This is the main file and entry point for the executable of *blackstar*.
+
+We need language pragmas
+
+#+begin_src haskell :tangle yes
+{-# LANGUAGE DeriveDataTypeable #-}
+#+end_src
+
+and also special GHC options.
+
+#+begin_src haskell :tangle yes
+{-# OPTIONS_GHC -fno-cse #-}
+#+end_src
+
+Of course we name the module /Main/ with no explicit exports.
+
+#+begin_src haskell :tangle yes
+module Main where
+#+end_src
+
+There are some libraries to import, none of them qualified.
+
+#+begin_src haskell :tangle yes
+-- Control imports
+import Control.Monad ( when
+                     , forM_
+                     )
+-- Data imports
+import Data.List ( sort )
+import Data.Yaml ( decodeFileEither
+                 , prettyPrintParseException
+                 )
+-- System imports
+import System.Console.ANSI ( clearScreen
+                           , setCursorPosition
+                           )
+import System.Console.CmdArgs
+import System.Directory
+import System.FilePath ( takeBaseName
+                       , takeExtension
+                       , (</>), (<.>)
+                       )
+#+end_src
+
+The following are imports from the library of this project.
+
+#+begin_src haskell :tangle yes
+import ConfigFile
+import ImageFilters
+import Raytracer
+import StarMap
+import Util
+#+end_src
+
+Some data structure representing the black hole.
+
+#+begin_src haskell :tangle yes
+data Blackstar = Blackstar { preview :: Bool
+                           , output :: String
+                           , force :: Bool
+                           , starmap :: String
+                           , inputfile :: String
+                           } deriving (Show, Data, Typeable)
+#+end_src
+
+An argument parser for looking at your config.
+
+#+begin_src haskell :tangle yes
+argparser :: Blackstar
+argparser = Blackstar { preview = def
+                          &= help "preview render (small size)"
+                      , output = ""
+                          &= help "output directory"
+                          &= typ "PATH"
+                      , force = def
+                          &= help "overwrite images without asking"
+                      , starmap = "stars.kdt"
+                          &= help "path to starmap"
+                          &= typ "PATH"
+                      , inputfile = def
+                          &= argPos 0
+                          &= typ "INPUTFILE"
+                      } &= summary "Blackstar v0.1"
+#+end_src
+
+The main function.
+
+#+begin_src haskell :tangle yes
+main :: IO ()
+main = do
+    cmdline <- cmdArgs argparser
+    etree <- readTreeFromFile $ starmap cmdline
+    case etree of
+        Right tree -> putStrLn "Starmap successfully read."
+            >> doStart cmdline tree
+        Left  err  -> putStrLn $ "Error decoding star tree: \n" ++ err
+#+end_src
+
+The following functions are used in /main/.
+
+#+begin_src haskell :tangle yes
+doStart :: Blackstar -> StarTree -> IO ()
+doStart cmdline tree = do
+    -- Resolve the output directory
+    when (output cmdline /= "")
+        $ createDirectoryIfMissing True (output cmdline)
+    outdir <- normalizePath =<< case output cmdline of
+                  "" -> getCurrentDirectory
+                  x  -> return x
+    createDirectoryIfMissing True outdir
+    -- Resolve the input file or directory
+    filename <- normalizePath $ inputfile cmdline
+    isDir <- doesDirectoryExist filename
+    if isDir then do
+            putStrLn $ filename
+                ++ " is a directory. Rendering all scenes inside it..."
+
+            inputFiles <- map (filename </>)
+                . sort . filter (\f -> takeExtension f == ".yaml")
+                <$> getDirectoryContents filename
+
+            forM_ (zip inputFiles [(1 :: Int)..]) $ \(scn, idx) -> do
+                clearScreen
+                setCursorPosition 0 0
+                putStrLn $ "Batch mode progress: " ++ show idx ++ "/"
+                    ++ show (length inputFiles)
+                handleScene cmdline tree outdir scn
+        else handleScene cmdline tree outdir filename
+#+end_src
+
+#+begin_src haskell :tangle yes
+handleScene :: Blackstar -> StarTree -> String -> String -> IO ()
+handleScene cmdline tree outdir filename = do
+    let pvw = preview cmdline
+    let sceneName = takeBaseName filename
+    putStrLn $ "Reading " ++ filename ++ "..."
+    cfg <- decodeFileEither filename
+    let sceneName' = if pvw then "prev-" ++ sceneName else sceneName
+    case cfg of
+        Right config -> putStrLn "Scene successfully read."
+                          >> doRender cmdline (prepareScene config pvw) tree
+                               sceneName' outdir
+        Left  err    -> putStrLn $ prettyPrintParseException err
+#+end_src
+
+#+begin_src haskell :tangle yes
+prepareScene :: Config -> Bool -> Config
+prepareScene cfg doPreview = let
+    scn = scene cfg
+    (w, h) = resolution scn
+    res = 300
+    newRes = if w >= h then (res, res * h `div` w) else (res * w `div` h, res)
+    newScn = if doPreview then scn { resolution = newRes
+                                   , supersampling = False
+                                   , bloomStrength = 0 }
+                          else scn
+    in cfg { scene = newScn }
+#+end_src
+
+#+begin_src haskell :tangle yes
+doRender :: Blackstar -> Config -> StarTree -> String -> String -> IO ()
+doRender cmdline cfg tree sceneName outdir = do
+    putStrLn $ "Rendering " ++ sceneName ++ "..."
+    let scn = scene cfg
+    img <- timeAction "Rendering" $ render cfg tree
+
+    let outName = outdir </> sceneName <.> ".png"
+
+    final <- if bloomStrength scn /= 0
+        then do
+            putStrLn "Applying bloom..."
+            bloomed <- bloom (bloomStrength scn) (bloomDivider scn) img
+            timeAction "Bloom" bloomed
+        else return img
+
+    putStrLn $ "Saving to " ++ outName ++ "..."
+    if force cmdline
+      then writeImg final outName
+      else promptOverwriteFile outName (writeImg final)
+
+    putStrLn "Everything done. Thank you!"
+#+end_src
